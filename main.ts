@@ -1,25 +1,34 @@
-// main.ts is mend, the CLI SPEC.md specifies. Node 22, the standard library alone; run it as `node main.ts [options] [PATCH]`.
+// mend — one patch tool for every AI edit format.
 //
-// It reads a patch in one of four formats (unified diffs with wrong line numbers, SEARCH/REPLACE blocks, V4A
-// patches and JSON tool calls), finds the lines each edit names at the first of three matching tiers, and writes
-// every change or none. SPEC.md is the whole contract.
+// Run as `node main.ts [options] [PATCH]`, Node 22, standard library only.
+// A patch arrives in one of four shapes — a unified diff (whose line numbers
+// may be wrong), SEARCH/REPLACE blocks, a V4A patch, or JSON tool calls — and
+// is applied to the tree rooted at the working directory. Old lines are
+// looked up at the first of three matching tiers (exact, then trailing
+// whitespace ignored, then both ends ignored with re-indentation), and the
+// whole patch lands or nothing does: any failing edit leaves every file
+// untouched while the edits after it still run and report.
 //
-// Sections 1 to 4, 9 and 10 (the command line, the output and exit codes, safe paths, format detection, JSON edits
-// and the all-or-nothing write) are implemented below; sections 5 to 8 (three-tier matching, unified diffs,
-// SEARCH/REPLACE blocks and V4A patches) are implemented in the middle of this file. The last lines hand a trial
-// over to runner.ts when MAKEFUN_ENV_URL is set: keep that hand-over and runner.ts as they are.
+// The contract is SPEC.md. This file follows it section by section: the
+// command line and exit codes (sections 1, 2, 10) at the bottom, the shared
+// line/tier machinery (sections 3 and 5) just below, and one parser plus one
+// applier per format (sections 6 to 9) in between. When MAKEFUN_ENV_URL is
+// set the file hands the run over to runner.ts, which the kit provides.
 
 import { mkdirSync, readFileSync, rmSync, statSync, writeFileSync, writeSync } from 'node:fs';
 import { dirname } from 'node:path';
 
 const FORMATS = ['auto', 'unified', 'search-replace', 'v4a', 'json'];
 
+/** Thrown to stop with an exit-2 line, e.g. `error: parse 7`. */
 class Exit2 {
   readonly line: string;
   constructor(line: string) {
     this.line = line;
   }
 }
+
+/** One edit that failed, with the code and path the report names. */
 class Fail {
   readonly code: string;
   readonly path: string;
@@ -31,23 +40,31 @@ class Fail {
 
 const blank = (s: string): boolean => s.trim() === '';
 
-function patchLines(text: string): string[] {
+/** A patch's text as lines: split at `\n`, one trailing `\r` off each line, no empty piece after a final `\n`. */
+function splitPatchLines(text: string): string[] {
   if (text === '') return [];
   const lines = text.split('\n');
   if (text.endsWith('\n')) lines.pop();
   return lines.map((l) => (l.endsWith('\r') ? l.slice(0, -1) : l));
 }
 
+/** A path is safe when it is relative, has no backslash, and no segment is empty, `.` or `..`. */
 function safe(p: string): boolean {
   return p !== '' && !p.startsWith('/') && !p.includes('\\') && p.split('/').every((s) => s !== '' && s !== '.' && s !== '..');
 }
 
-/** The tree as the edits leave it: changed paths in `now` (null: deleted), the rest read from disk. */
+/**
+ * The tree as the edits leave it. `now` holds only paths an edit touched
+ * (null means deleted); anything else is read from disk on demand, and
+ * `original` remembers what disk said the first time it was asked so the
+ * final report can tell what changed. Successful moves are recorded in
+ * order so the report can print one `R` line for each.
+ */
 class Tree {
   private readonly orig = new Map<string, string | null>();
   readonly now = new Map<string, string | null>();
-  /** Successful moves, as [old, new] pairs, in the order the edits ran. */
   readonly moves: Array<[string, string]> = [];
+
   original(p: string): string | null {
     if (!this.orig.has(p)) {
       let v: string | null = null;
@@ -60,13 +77,16 @@ class Tree {
     }
     return this.orig.get(p)!;
   }
+
   get(p: string): string | null {
     return this.now.has(p) ? this.now.get(p)! : this.original(p);
   }
 }
 
+/** One parsed edit: run it against the tree, throwing Fail when it cannot apply. */
 type Edit = (tree: Tree) => void;
 
+/** Auto-detection (SPEC.md section 4): the first rule that holds wins, else null. */
 function detect(lines: string[]): string | null {
   const first = lines.findIndex((l) => !blank(l));
   if (first < 0) return null;
@@ -88,6 +108,7 @@ interface FileState {
   final: boolean;
 }
 
+/** Split a file's text at its own line break; remember whether it ends with one. */
 function parseFile(text: string): FileState {
   if (text === '') return { br: '\n', lines: [], final: false };
   const nl = text.indexOf('\n');
@@ -98,6 +119,7 @@ function parseFile(text: string): FileState {
   return { br, lines, final };
 }
 
+/** Join a file state back to text: no lines means empty, whatever `final` says. */
 function serializeFile(f: FileState): string {
   if (f.lines.length === 0) return '';
   return f.lines.join(f.br) + (f.final ? f.br : '');
@@ -108,13 +130,14 @@ function leadingWs(s: string): string {
   return m === null ? '' : m[0];
 }
 
-/** A line as a tier sees it: tier 0 exact, tier 1 without trailing spaces/tabs, tier 2 without either end. */
+/** How a tier sees one line: 0 exact, 1 without trailing spaces/tabs, 2 without either end. */
 function normLine(s: string, tier: number): string {
   if (tier === 0) return s;
   if (tier === 1) return s.replace(/[ \t]+$/, '');
   return s.replace(/^[ \t]+/, '').replace(/[ \t]+$/, '');
 }
 
+/** Every position at or after `from` where O matches the file's lines at one tier; occurrences may overlap. */
 function occurrencesAt(o: string[], lines: string[], tier: number, from: number): number[] {
   const out: number[] = [];
   if (o.length === 0) return out;
@@ -132,9 +155,10 @@ function occurrencesAt(o: string[], lines: string[], tier: number, from: number)
 }
 
 /**
- * The first tier (0, then 1, then 2; only 0 when strict) at which O occurs at least once at or after
- * `from`, with every occurrence at that tier. When `eofOnly`, only occurrences ending at the file's last
- * line count. Null when O occurs at no tier.
+ * The first tier (0, then 1, then 2; only 0 when strict) at which O occurs
+ * at least once at or after `from`, with every occurrence at that tier.
+ * With `eofOnly`, only occurrences ending at the file's last line count.
+ * Null when O occurs at no tier.
  */
 function findTier(
   o: string[],
@@ -152,18 +176,20 @@ function findTier(
   return null;
 }
 
+/** One line of N: a context line is copied from the file, anything else is taken from the patch. */
 interface NewItem {
   text: string;
-  /** True for a context line: written as the file's own matched line, never the patch's. */
   ctx: boolean;
   /** For a context line, its index inside O. */
   oIdx: number;
 }
 
 /**
- * The replacement lines N for a match of O at position `at` in the file's lines. Context lines come from
- * the file; at tier 2 every other non-empty, non-whitespace line that starts with P (the leading spaces
- * and tabs of O's first line) has that P replaced by F (those of the file's first matched line).
+ * The replacement lines N for a match of O at position `at`. Context lines
+ * come from the file's own matched lines, never the patch's. At tier 2 every
+ * other non-empty, non-whitespace line that starts with P (the leading
+ * spaces and tabs of O's first line) has that P replaced by F (those of the
+ * file's first matched line); at tiers 0 and 1 the lines are written as they are.
  */
 function buildNewLines(n: NewItem[], o: string[], fileLines: string[], at: number, tier: number): string[] {
   const out: string[] = [];
@@ -190,19 +216,44 @@ function lastCtxOrNew(items: BodyItem[]): BodyItem | null {
   return null;
 }
 
+/**
+ * Split a hunk or chunk body into its old lines O (context and `-` lines,
+ * in order) and its new lines N (context lines marked with their index
+ * inside O so buildNewLines can copy them from the file, `+` lines as
+ * plain text). Unified hunks and V4A chunks share this shape.
+ */
+function splitBodyItems(items: BodyItem[]): { o: string[]; n: NewItem[] } {
+  const o: string[] = [];
+  const n: NewItem[] = [];
+  let oIdx = 0;
+  for (const it of items) {
+    if (it.kind === 'ctx') {
+      o.push(it.text);
+      n.push({ text: it.text, ctx: true, oIdx });
+      oIdx++;
+    } else if (it.kind === 'old') {
+      o.push(it.text);
+      oIdx++;
+    } else {
+      n.push({ text: it.text, ctx: false, oIdx: -1 });
+    }
+  }
+  return { o, n };
+}
+
 // ---------------------------------------------------------------------------
 // Unified diffs (SPEC.md section 6).
 // ---------------------------------------------------------------------------
 
+/** One line of a hunk body: ` ` context, `-` old, `+` new; `noNL` when a `\` line follows it. */
 interface BodyItem {
   kind: 'ctx' | 'old' | 'new';
   text: string;
-  /** A `\` line follows this body line: the file does not end with a line break here. */
   noNL: boolean;
 }
 
+/** A hunk: `a` is the 1-based old start line from its `@@` header. */
 interface Hunk {
-  /** A: the 1-based old start line of the hunk header. */
   a: number;
   items: BodyItem[];
 }
@@ -215,6 +266,18 @@ interface UniSection {
   hunks: Hunk[];
 }
 
+/**
+ * Read the patch's sections and hunks. A section starts at a `diff --git`
+ * line or at a `---`/`+++` pair outside a body; inside a section, before
+ * its first hunk, header lines name the paths and the create/delete flags,
+ * and everything else is ignored. A `---` line not followed by `+++` inside
+ * a header is a parse error naming the line after it; a malformed
+ * `diff --git` or `@@` line, and a hunk before any section, name their own
+ * line. A hunk body runs until the first line that is none of ` `, `-`, `+`,
+ * `\` or empty (an empty line counts as an empty context line), a new
+ * `diff --git` line, or a `---`/`+++` pair; trailing empty lines are not
+ * part of it. Lines outside bodies and headers are ignored.
+ */
 function parseUnified(lines: string[], strict: boolean): Edit[] {
   const diffRe = /^diff --git a\/(.+) b\/(.+)$/;
   const hunkRe = /^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/;
@@ -338,25 +401,21 @@ function parseUnified(lines: string[], strict: boolean): Edit[] {
   return sections.map((s) => uniEdit(s, strict));
 }
 
-/** Apply a section's hunks in order to a file state, each to the result of the ones before it. */
+/**
+ * Apply a section's hunks in order to a file state, each to the result of
+ * the ones before it. O is the hunk's context and `-` lines, N its context
+ * and `+` lines. `d` tracks how much the hunks applied so far shifted the
+ * line numbers, so a hunk whose header numbers are wrong still lands on
+ * the occurrence nearest to A - 1 + d (the earlier of two equally near).
+ * An empty O inserts N after the first A + d lines. When the matched lines
+ * run to the end of the file (or the insertion lands at the end), the
+ * result ends with a line break unless a `\` line follows the hunk's last
+ * context or `+` line; otherwise the file's final break stays as it was.
+ */
 function applyHunks(state: FileState, hunks: Hunk[], strict: boolean, path: string): FileState {
   let d = 0;
   for (const h of hunks) {
-    const o: string[] = [];
-    const n: NewItem[] = [];
-    let oIdx = 0;
-    for (const it of h.items) {
-      if (it.kind === 'ctx') {
-        o.push(it.text);
-        n.push({ text: it.text, ctx: true, oIdx });
-        oIdx++;
-      } else if (it.kind === 'old') {
-        o.push(it.text);
-        oIdx++;
-      } else {
-        n.push({ text: it.text, ctx: false, oIdx: -1 });
-      }
-    }
+    const { o, n } = splitBodyItems(h.items);
     const last = lastCtxOrNew(h.items);
     if (o.length === 0) {
       const idx = Math.min(Math.max(h.a + d, 0), state.lines.length);
@@ -390,6 +449,7 @@ function applyHunks(state: FileState, hunks: Hunk[], strict: boolean, path: stri
   return state;
 }
 
+/** One section is one edit: create, delete, move, or change of a single path. */
 function uniEdit(section: UniSection, strict: boolean): Edit {
   return (tree) => {
     const oldP = section.oldPath;
@@ -438,6 +498,15 @@ function uniEdit(section: UniSection, strict: boolean): Edit {
 // SEARCH/REPLACE blocks (SPEC.md section 7).
 // ---------------------------------------------------------------------------
 
+/**
+ * Read the patch's blocks. A block's path is the nearest non-blank line
+ * before its `<<<<<<< SEARCH` line (and after the previous block's
+ * `>>>>>>> REPLACE`, or the start of the patch) that does not start with
+ * three backticks; with no such line the block takes the previous block's
+ * path, and the first block with none is a parse error naming its SEARCH
+ * line. A SEARCH line with no `=======` and then `>>>>>>> REPLACE` after it
+ * is a parse error naming the SEARCH line. Lines outside blocks are ignored.
+ */
 function parseSearchReplace(lines: string[], strict: boolean): Edit[] {
   const edits: Edit[] = [];
   let prevEnd = 0;
@@ -488,6 +557,11 @@ function parseSearchReplace(lines: string[], strict: boolean): Edit[] {
   return edits;
 }
 
+/**
+ * One block is one edit. Empty old lines create the file with the new
+ * lines; otherwise the file must exist and the old lines must occur at
+ * their tier exactly once, or the block fails `ambiguous`.
+ */
 function srEdit(path: string, oldLines: string[], newLines: string[], strict: boolean): Edit {
   return (tree) => {
     if (!safe(path)) throw new Fail('unsafe', path);
@@ -514,14 +588,30 @@ function srEdit(path: string, oldLines: string[], newLines: string[], strict: bo
 // V4A patches (SPEC.md section 8).
 // ---------------------------------------------------------------------------
 
+/** One chunk of an Update File section: an optional anchor, an end-of-file flag, and its body lines. */
 interface VChunk {
-  /** Null or empty: no anchor. */
   anchor: string | null;
-  /** True when a `*** End of File` line closed this chunk. */
   eof: boolean;
   items: BodyItem[];
 }
 
+/**
+ * Read a V4A patch. The first non-blank line must be `*** Begin Patch` and
+ * the last non-blank line `*** End Patch`, compared with surrounding
+ * whitespace removed; the first fault names the offending line, and a
+ * missing Begin Patch with no non-blank line at all is `error: parse 1`,
+ * while a missing End Patch names the number of patch lines plus 1. Between
+ * them, sections start at `*** Add File: `, `*** Delete File: ` and
+ * `*** Update File: ` lines, blank lines between sections are ignored, and
+ * blank lines at the end of a section are not part of it. Any other line is
+ * a parse error naming its line: an Add File section's lines start with `+`
+ * or are empty; a Delete File section has no lines; an Update File section
+ * may have `*** Move to: <path>` as its first line, then chunks — a chunk
+ * starts at an `@@` line (the text after it, trimmed, is the anchor; empty
+ * text is no anchor) or, for the first chunk, at a body line, and a
+ * `*** End of File` line ends a chunk and anchors it to the file's end. An
+ * Update File section with no chunk and no `*** Move to:` names its own line.
+ */
 function parseV4A(lines: string[], strict: boolean): Edit[] {
   const first = lines.findIndex((l) => !blank(l));
   if (first < 0) throw new Exit2('error: parse 1');
@@ -663,6 +753,19 @@ function findAnchor(anchor: string, lines: string[], cursor: number, strict: boo
   return -1;
 }
 
+/**
+ * One Update File section: its chunks apply in order, with a cursor that
+ * starts at line 0. A chunk with an anchor first finds the first line at or
+ * after the cursor equal to the anchor at the first tier where one is, else
+ * `no-match`, and the cursor moves past it. O is the chunk's context and `-`
+ * lines, N its context and `+` lines; the chunk takes the first occurrence
+ * of O at or after the cursor at the first tier with one, and an
+ * end-of-file chunk takes only an occurrence that ends at the file's last
+ * line. An empty O inserts N at the cursor (or at the end of the file for
+ * an end-of-file chunk). The cursor then moves to just after the lines
+ * written. With Move to, the result is written at the new path and the old
+ * path deleted.
+ */
 function v4aUpdateEdit(path: string, moveTo: string | null, chunks: VChunk[], strict: boolean): Edit {
   return (tree) => {
     if (!safe(path)) throw new Fail('unsafe', path);
@@ -678,21 +781,7 @@ function v4aUpdateEdit(path: string, moveTo: string | null, chunks: VChunk[], st
         if (at < 0) throw new Fail('no-match', path);
         cursor = at + 1;
       }
-      const o: string[] = [];
-      const n: NewItem[] = [];
-      let oIdx = 0;
-      for (const it of ch.items) {
-        if (it.kind === 'ctx') {
-          o.push(it.text);
-          n.push({ text: it.text, ctx: true, oIdx });
-          oIdx++;
-        } else if (it.kind === 'old') {
-          o.push(it.text);
-          oIdx++;
-        } else {
-          n.push({ text: it.text, ctx: false, oIdx: -1 });
-        }
-      }
+      const { o, n } = splitBodyItems(ch.items);
       if (o.length === 0) {
         const idx = ch.eof ? st.lines.length : cursor;
         const nTexts = n.map((x) => x.text);
@@ -724,7 +813,14 @@ function v4aUpdateEdit(path: string, moveTo: string | null, chunks: VChunk[], st
 // JSON edits (SPEC.md section 9).
 // ---------------------------------------------------------------------------
 
-/** One JSON edit object (SPEC.md section 9), or null when it is not one. */
+/** How many times `needle` occurs in `text`, counting overlapping positions. */
+function countOccurrences(text: string, needle: string): number {
+  let count = 0;
+  for (let k = text.indexOf(needle); k >= 0; k = text.indexOf(needle, k + 1)) count += 1;
+  return count;
+}
+
+/** One JSON edit object (SPEC.md section 9), or null when it is not one. Extra keys are ignored. */
 function jsonEdit(v: unknown): Edit | null {
   if (v === null || typeof v !== 'object' || Array.isArray(v)) return null;
   const o = v as Record<string, unknown>;
@@ -754,8 +850,7 @@ function jsonEdit(v: unknown): Edit | null {
       const lf = (s: string): string => (crlf ? s.replaceAll('\r\n', '\n') : s);
       const t = lf(before);
       const old = lf(oldStr);
-      let count = 0;
-      for (let k = t.indexOf(old); k >= 0; k = t.indexOf(old, k + 1)) count += 1;
+      const count = countOccurrences(t, old);
       if (count === 0) throw new Fail('no-match', p);
       if (count > 1) throw new Fail('ambiguous', p);
       const at = t.indexOf(old);
@@ -765,7 +860,7 @@ function jsonEdit(v: unknown): Edit | null {
   }
   if (o.command === 'insert' && typeof o.insert_line === 'number' && Number.isInteger(o.insert_line) && typeof o.new_str === 'string') {
     const line = o.insert_line;
-    const add = patchLines(o.new_str);
+    const add = splitPatchLines(o.new_str);
     return (tree) => {
       const before = exists(tree);
       const nl = before.indexOf('\n');
@@ -781,6 +876,13 @@ function jsonEdit(v: unknown): Edit | null {
   return null;
 }
 
+/**
+ * Read the JSON patch. Either one JSON array of edit objects — any fault
+ * names the line where the array starts — or JSON Lines: one edit object a
+ * line, blank lines ignored, a line that does not hold one valid edit
+ * object naming its own line. A wrong command or a missing or mistyped key
+ * is a parse fault.
+ */
 function jsonEdits(text: string, lines: string[]): Edit[] {
   const first = lines.findIndex((l) => !blank(l));
   if (first < 0) throw new Exit2('error: parse 1');
@@ -818,6 +920,25 @@ function jsonEdits(text: string, lines: string[]): Edit[] {
 // Running the CLI (SPEC.md sections 1, 2 and 10).
 // ---------------------------------------------------------------------------
 
+/**
+ * Run one invocation and return its exit code and stdout lines. A usage
+ * error is an unknown `-` argument (before `--`), a repeated option, a
+ * `--format` value outside the five names, or more than one positional
+ * argument; it wins over everything. Then, in order: the patch file cannot
+ * be read (`error: no-patch`), auto-detection finds no format
+ * (`error: format`), and parse errors — reported before any file is looked
+ * at, and an empty edit list is `error: parse 1`. Edits then run in patch
+ * order against the tree as earlier edits left it; a failed edit rolls its
+ * own partial change back (the snapshot taken before it ran) and is
+ * reported, while the edits after it still run. Any failure means exit 1
+ * with one `error: <code> <path>` line per failure in patch order and a
+ * `failed: <k> of <n> edits` line, and no file is written. Otherwise the
+ * changed paths are written (unless `--check`), and the report lists one
+ * line per changed path in byte order — `A`, `D`, `M`, or one `R <old> ->
+ * <new>` line replacing a move's `D`/`A` pair, sorted by `<new>` — then
+ * `ok: <n> files` (or `ok: 1 file`). A path whose bytes are unchanged is
+ * not listed.
+ */
 function run(args: string[]): { code: number; out: string[] } {
   let format: string | null = null;
   let check = false;
@@ -841,7 +962,7 @@ function run(args: string[]): { code: number; out: string[] } {
   } catch {
     if (file !== null) return { code: 2, out: ['error: no-patch'] };
   }
-  const lines = patchLines(text);
+  const lines = splitPatchLines(text);
   const kind = format === null || format === 'auto' ? detect(lines) : format;
   if (kind === null) return { code: 2, out: ['error: format'] };
   let edits: Edit[];
